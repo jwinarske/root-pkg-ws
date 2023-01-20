@@ -7,6 +7,6 @@ edition = "2021"
 cargo_metadata = "0.15"
 indexmap = "1.9.1"
 tempfile = "3.3.0"
-git2 = "0.15.0"
+git2 = "0.16.1"
 glob = "0.3.0"
 clap = { version = "4.0.15", features = ["derive"] }
