@@ -14,4 +14,12 @@ Replace SRC_URI section of recipe with output from this tool.
 The plan is to submit a PR to meta-rust/cargo-bitbake at some point.
 
 
+## Process to get correct dependencies for recipe
+
+* If there is not a `rust_toolchain` file in project:
+   * create `rust_toolchain` file in root of project that matches the version Yocto is locked to
+   * delete Cargo.lock
+   * locally build release variant of project to update Cargo.lock
+* run root-pkg-ws on the manifest file (Cargo.toml) of the desired project
+
 Example rust-toolchain lock file:  https://github.com/google/crosvm/blob/main/rust-toolchain
