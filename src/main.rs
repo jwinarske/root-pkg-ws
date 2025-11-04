@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use cargo_metadata::CargoOpt;
 
 use clap::Parser;
-use git2::{Cred, Oid, RemoteCallbacks};
+use git2::{Cred, RemoteCallbacks};
 use glob::glob;
 use indexmap::IndexSet;
 use tempfile::tempdir;
@@ -20,10 +20,12 @@ struct Cli {
     manifest_path: String,
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Eq, Hash, PartialEq, Debug, Clone)]
 struct GitRepo {
     url: String,
-    commit: String,
+    rev: Option<String>,
+    tag: Option<String>,
+    branch: Option<String>,
 }
 
 fn dump_metadata(
@@ -79,7 +81,12 @@ fn dump_metadata(
                 } else {
                     commit = elements[1].to_owned();
                 }
-                let git_repo = GitRepo { url, commit };
+                let git_repo = GitRepo {
+                    url,
+                    rev: Some(commit),
+                    branch: None,
+                    tag: None,
+                };
                 git.insert(git_repo);
             } else {
                 println!("[not handled] {}", iter[2]);
@@ -108,13 +115,38 @@ fn dump_metadata(
                 let repository: Vec<_> = repo[1].split('?').collect();
                 let url: String = repository[0].to_owned();
                 let elements: Vec<_> = repository[1].split('#').collect();
-                let commit;
+                let selector;
                 if elements.len() > 2 {
-                    commit = elements[1].to_owned();
+                    selector = elements[1].to_owned();
                 } else {
-                    commit = elements[0].to_owned();
+                    selector = elements[0].to_owned();
                 }
-                let git_repo = GitRepo { url, commit };
+                let git_repo = match selector.split("=").collect::<Vec<&str>>().as_slice() {
+                    ["rev", rev_name] => GitRepo {
+                        url,
+                        rev: Some(rev_name.to_string()),
+                        branch: None,
+                        tag: None,
+                    },
+                    ["tag", tag_name] => GitRepo {
+                        url,
+                        rev: None,
+                        branch: None,
+                        tag: Some(tag_name.to_string()),
+                    },
+                    ["branch", branch_name] => GitRepo {
+                        url,
+                        rev: None,
+                        branch: Some(branch_name.to_string()),
+                        tag: None,
+                    },
+                    _ => GitRepo {
+                        url,
+                        rev: None,
+                        branch: None,
+                        tag: None,
+                    },
+                };
                 git.insert(git_repo);
             } else {
                 println!("[not handled] {}", repr);
@@ -176,44 +208,65 @@ fn main() {
     let mut builder = git2::build::RepoBuilder::new();
     builder.fetch_options(fo);
 
-    for _git in git_list.iter() {
-        let protocol: Vec<_> = _git.url.split("://").collect();
-        let folder = get_repo_folder_name(protocol[1].to_string());
-        println!(
-            "    git://{};lfs=0;nobranch=1;protocol={};destsuffix={};name={} \\",
-            protocol[1], protocol[0], folder, folder
-        );
+    let git_list: IndexSet<GitRepo> = git_list
+        .iter()
+        .cloned()
+        .map(|git_repo| {
+            let protocol: Vec<_> = git_repo.url.split("://").collect();
+            let folder = get_repo_folder_name(protocol[1].to_string());
+            println!(
+                "    git://{};lfs=0;nobranch=1;protocol={};destsuffix={};name={} \\",
+                protocol[1], protocol[0], folder, folder
+            );
 
-        let sub_folder = get_repo_folder_name(_git.url.to_string());
-        let folder = dir.path().join(sub_folder);
-        let repo = builder
-            .clone(&_git.url, Path::new(&folder))
-            .expect("failed to clone repository");
+            let sub_folder = get_repo_folder_name(git_repo.url.to_string());
+            let folder = dir.path().join(sub_folder);
+            let repo = builder
+                .clone(&git_repo.url, Path::new(&folder))
+                .expect("failed to clone repository");
 
-        let oid = Oid::from_str(&_git.commit).unwrap();
-        let commit = repo.find_commit(oid).unwrap();
+            let spec = match &git_repo {
+                GitRepo { rev: Some(rev), .. } => rev.clone(),
+                GitRepo { tag: Some(tag), .. } => format!("refs/tags/{}", tag),
+                GitRepo {
+                    branch: Some(branch),
+                    ..
+                } => format!("refs/remotes/origin/{}", branch),
+                _ => return git_repo,
+            };
 
-        let _ = repo.branch(&_git.commit, &commit, false);
+            let obj = repo.revparse_single(&spec).unwrap();
 
-        let obj = repo
-            .revparse_single(&("refs/heads/".to_owned() + &_git.commit))
-            .unwrap();
+            let _ = repo.branch(
+                &format!("commit_{}", obj.id()),
+                &obj.as_commit().unwrap(),
+                false,
+            );
+            let _ = repo.checkout_tree(&obj, None);
+            let _ = repo.set_head(&format!("refs/heads/{}", obj.id()));
 
-        let _ = repo.checkout_tree(&obj, None);
-
-        let _ = repo.set_head(&("refs/heads/".to_owned() + &_git.commit));
-
-        let _glob = String::from(folder.join("**/Cargo.toml").to_string_lossy());
-        for entry in glob(&_glob).unwrap() {
-            match entry {
-                Ok(manifest) => {
-                    let mut _git_list = IndexSet::new();
-                    let _ = dump_metadata(manifest, &mut crate_list, &mut _git_list);
+            let _glob = String::from(folder.join("**/Cargo.toml").to_string_lossy());
+            for entry in glob(&_glob).unwrap() {
+                match entry {
+                    Ok(manifest) => {
+                        // creates are added recursively
+                        // git repos are only added at top-level
+                        // is that intentional?
+                        let mut _git_list = IndexSet::new();
+                        let _ = dump_metadata(manifest, &mut crate_list, &mut _git_list);
+                    }
+                    Err(e) => println!("Err: {:?}", e),
                 }
-                Err(e) => println!("Err: {:?}", e),
             }
-        }
-    }
+
+            GitRepo {
+                url: git_repo.url.clone(),
+                rev: Some(obj.id().to_string()),
+                branch: git_repo.branch.clone(),
+                tag: git_repo.tag.clone(),
+            }
+        })
+        .collect();
     dir.close().unwrap();
     println!("\"\n");
 
@@ -221,7 +274,7 @@ fn main() {
         let protocol: Vec<_> = _git.url.split("://").collect();
         let folder = get_repo_folder_name(protocol[1].to_string());
         println!("SRCREV_FORMAT .= \"_{}\"", folder);
-        println!("SRCREV_{} = \"{}\"", folder, _git.commit);
+        println!("SRCREV_{} = \"{}\"", folder, _git.rev.clone().unwrap());
     }
 
     if !git_list.is_empty() {
